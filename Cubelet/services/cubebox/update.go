@@ -258,34 +258,45 @@ func (s *service) admitResume(
 	// totals plus the aggregate snapshot above decide, and the demand is
 	// registered before the lock is released, so no concurrent admission can
 	// slip between observing and registering.
-	ledger := &s.cubeboxMgr.reservations
-	ledger.mu.Lock()
-	if s.cubeboxMgr.aggregateCacheGeneration() != allocGen {
-		// A release invalidated the cache between the read above and this
-		// lock: its Save (or rollback restore) moved the store past the view
-		// in hand, and its reservation may already be gone from the totals.
-		// Re-read under the lock so the decision never pairs a pre-Save view
-		// with a post-release ledger (an r·F under-count). Rare — only when a
-		// release lands inside this admission's own critical path — and the
-		// rescan happens at most once per invalidation, not per admission.
-		alloc, _ = s.cubeboxMgr.aggregateAllocatedCached()
-	}
-	reservedMemMB, reservedCPUMilli := ledger.totalsLocked()
-	reason := resumeQuotaRejection(resumeQuotaCheck{
-		// In-flight reservations count as used: they are admitted demand the
-		// store cannot show yet (or still shows as a tombstone fraction).
-		usedMemMB:     alloc.MemoryMB + reservedMemMB,
-		needMemMB:     needMemMB,
-		memQuotaMB:    memQuotaMB,
-		usedCPUMilli:  alloc.MilliCPU + reservedCPUMilli,
-		needCPUMilli:  needCPUMilli,
-		cpuQuotaMilli: cpuQuotaMilli,
-	})
-	var release func()
-	var replaced *resumeReservation
-	if reason == "" {
-		dropReservation, replacedEntry := ledger.reserveLocked(id, needMemMB, needCPUMilli)
-		replaced = replacedEntry
+	//
+	// The unlock is deferred inside a closure on purpose. This lock is
+	// node-wide and the section reaches into the store (the re-read below can
+	// scan every row and log), so a panic here that skipped a hand-written
+	// Unlock would leave every subsequent resume on the node blocked inside
+	// admitResume — each while holding its own sandbox lifecycle lock. The
+	// ledger must fail closed on rejection, never wedge the node.
+	release, replaced, reason := func() (func(), *resumeReservation, string) {
+		ledger := &s.cubeboxMgr.reservations
+		ledger.mu.Lock()
+		defer ledger.mu.Unlock()
+
+		if s.cubeboxMgr.aggregateCacheGeneration() != allocGen {
+			// A release invalidated the cache between the read above and this
+			// lock: its Save (or rollback restore) moved the store past the
+			// view in hand, and its reservation may already be gone from the
+			// totals. Re-read under the lock so the decision never pairs a
+			// pre-Save view with a post-release ledger (an r·F under-count).
+			// Rare — only when a release lands inside this admission's own
+			// critical path — and the rescan happens at most once per
+			// invalidation, not per admission.
+			alloc, _ = s.cubeboxMgr.aggregateAllocatedCached()
+		}
+		reservedMemMB, reservedCPUMilli := ledger.totalsLocked()
+		reason := resumeQuotaRejection(resumeQuotaCheck{
+			// In-flight reservations count as used: they are admitted demand
+			// the store cannot show yet (or still shows as a tombstone
+			// fraction).
+			usedMemMB:     alloc.MemoryMB + reservedMemMB,
+			needMemMB:     needMemMB,
+			memQuotaMB:    memQuotaMB,
+			usedCPUMilli:  alloc.MilliCPU + reservedCPUMilli,
+			needCPUMilli:  needCPUMilli,
+			cpuQuotaMilli: cpuQuotaMilli,
+		})
+		if reason != "" {
+			return noopRelease, nil, reason
+		}
+		dropReservation, replaced := ledger.reserveLocked(id, needMemMB, needCPUMilli)
 		// The release invalidates the aggregate cache BEFORE dropping the
 		// reservation, which is what makes reading the cached aggregate
 		// outside the ledger lock safe. Whichever order an admission and this
@@ -297,12 +308,11 @@ func (s *service) admitResume(
 		// window: a view cached before the Save shows this sandbox as a
 		// T-fraction tombstone, and with the entry gone too the next
 		// admission would miss r·F of it for the rest of the TTL window.
-		release = func() {
+		return func() {
 			s.cubeboxMgr.invalidateAggregateCache()
 			dropReservation()
-		}
-	}
-	ledger.mu.Unlock()
+		}, replaced, ""
+	}()
 
 	if reason != "" {
 		ret := &errorcode.Ret{

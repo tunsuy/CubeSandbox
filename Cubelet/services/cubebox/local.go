@@ -287,10 +287,11 @@ type local struct {
 	// been updated. Zero value is ready to use; see resumeReservationLedger.
 	reservations resumeReservationLedger
 
-	// aggregateCache memoizes aggregateAllocated for a short TTL so the
-	// resume-admission critical section stays O(1) in the common case
-	// instead of rescanning every row on the node under the ledger lock.
-	// It is consulted only while that lock is held; see admitResume.
+	// aggregateCache memoizes aggregateAllocated for a short TTL so resume
+	// admission stays O(1) in the common case instead of rescanning every row
+	// on the node. admitResume reads it OUTSIDE the ledger lock and only
+	// re-reads inside the critical section when a release has bumped the
+	// generation in between; see admitResume and aggregateCache.
 	aggregateCache aggregateCache
 }
 

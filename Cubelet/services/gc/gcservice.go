@@ -360,8 +360,13 @@ func (l *gcService) loadOrStore(sandboxID string) (bool, func()) {
 // behind. Dropping the entry would strand them invisibly; reclaiming now
 // would destroy resumable state. Keeping it expresses "not yet": every pass
 // re-checks cheaply, and the entry resolves by itself when the tombstone's
-// lifecycle ends — a resume replaces the row (dropped as a live sandbox), a
-// user delete marks or removes it (cleanup proceeds and reclaims).
+// lifecycle ends. A user delete marks or removes the row, cleanup proceeds
+// and reclaims the leftovers. A resume replaces the row with a live sandbox,
+// which the "live sandbox ⇒ drop the record" rule below then applies: the
+// entry is dropped WITHOUT running cleanup, so that path reclaims nothing.
+// That asymmetry is deliberate — destroying resumable state to reclaim a
+// failed teardown's leftovers is the worse failure, and the resumed
+// sandbox's own lifecycle owns whatever remains.
 func (l *gcService) allowCleanup(ctx context.Context, sandboxID string) bool {
 	if l == nil || l.gc == nil || l.gc.cubeboxManger == nil {
 		return true

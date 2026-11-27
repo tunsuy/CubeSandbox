@@ -190,9 +190,17 @@ func (l *local) Create(ctx context.Context, opts *workflow.CreateContext) error 
 		//
 		// The dirty record created above is NOT stranded by the skipped stamp:
 		// allowCleanup keeps it (instead of dropping it) while the row is a
-		// live unmarked tombstone and re-checks every pass, so the failed
-		// teardown's leftover allocations are reclaimed once the tombstone is
-		// resumed or deleted.
+		// live unmarked tombstone and re-checks every pass. How it resolves
+		// depends on which way the tombstone's lifecycle ends: a user delete
+		// marks the row, allowCleanup then lets the cleanup flow run and the
+		// failed teardown's leftover allocations are reclaimed. A resume
+		// instead turns the row into a live sandbox, and allowCleanup's
+		// pre-existing "live sandbox ⇒ drop the record" rule then discards
+		// the entry without running cleanup — the leftovers are NOT reclaimed
+		// on that path. That is the deliberate trade for never destroying
+		// resumable state: a resumed sandbox is a running sandbox whose
+		// lifecycle (and eventual full destroy) owns whatever is left, rather
+		// than a gc pass reclaiming resources out from under it.
 		if constants.IsFailoverOperation(ctx) &&
 			cb.GetStatus() != nil &&
 			cb.GetStatus().Get().State() == cubebox.ContainerState_CONTAINER_PAUSED {
